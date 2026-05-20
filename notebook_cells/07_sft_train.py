@@ -1,7 +1,33 @@
 # =============================================================================
 # Cell: SFT training with LoRA.
 # Why: A clean baseline that other methods (DPO, MA-DPO) must beat.
+#
+# FIX for bitsandbytes/triton crash:
+#   We block bitsandbytes from being imported by PEFT. We do NOT use 8-bit
+#   quantization, so this is safe. If bnb is already broken in your env,
+#   this prevents the crash entirely.
 # =============================================================================
+import importlib
+import sys
+
+# --- Neutralize bitsandbytes so PEFT doesn't try to import it ----------------
+# This avoids "ModuleNotFoundError: No module named 'triton.ops'" on Colab.
+if "bitsandbytes" not in sys.modules:
+    # Create a dummy module so `import bitsandbytes` doesn't crash
+    import types
+    _fake_bnb = types.ModuleType("bitsandbytes")
+    _fake_bnb.__version__ = "0.0.0"
+    sys.modules["bitsandbytes"] = _fake_bnb
+    # Also block sub-imports that PEFT touches
+    for sub in ["bitsandbytes.nn", "bitsandbytes.nn.modules",
+                "bitsandbytes.functional", "bitsandbytes.autograd"]:
+        sys.modules[sub] = types.ModuleType(sub)
+
+# Now force peft to think bnb is NOT available so it skips the bnb dispatch.
+import peft.import_utils
+peft.import_utils.is_bnb_available = lambda: False
+peft.import_utils.is_bnb_4bit_available = lambda: False
+
 from transformers import Trainer, DataCollatorForLanguageModeling
 
 # Build SFT dataset: (prompt + gold_response) for each train example.
@@ -38,7 +64,7 @@ class SimpleSFTDataset(TorchDataset):
     def __getitem__(self, i): return self.items[i]
 
 
-# LoRA wrap.
+# LoRA wrap — now safe because we disabled the bnb dispatch above.
 peft_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
     r=CFG.lora_r,
