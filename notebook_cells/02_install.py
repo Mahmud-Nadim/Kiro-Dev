@@ -15,7 +15,8 @@
 #     "matplotlib>=3.9.0" \
 #     "seaborn>=0.13.0" \
 #     "tabulate>=0.9.0" \
-#     "pandas>=2.2.0"
+#     "pandas>=2.2.0" \
+#     "torchao>=0.16.0"
 #
 # # IMPORTANT: Uninstall bitsandbytes to avoid the triton.ops import crash.
 # # We do NOT use 8-bit quantization in this notebook, so bnb is not needed.

@@ -52,7 +52,17 @@ for fn_name in ["is_bnb_available", "is_bnb_4bit_available"]:
 peft.import_utils.is_bnb_available = lambda: False
 peft.import_utils.is_bnb_4bit_available = lambda: False
 
-print("bitsandbytes fully neutralized — PEFT will use standard fp16 LoRA only.")
+# --- Step 4: Neutralize torchao version check --------------------------------
+# PEFT >= 0.14 checks torchao version and raises ImportError if too old.
+# We don't use torchao quantization, so we disable the check entirely.
+for fn_name in ["is_torchao_available"]:
+    fn = getattr(peft.import_utils, fn_name, None)
+    if fn is not None and hasattr(fn, "cache_clear"):
+        fn.cache_clear()
+    if fn is not None:
+        setattr(peft.import_utils, fn_name, lambda: False)
+
+print("bitsandbytes + torchao neutralized — PEFT will use standard fp16 LoRA only.")
 
 from transformers import Trainer, DataCollatorForLanguageModeling
 
