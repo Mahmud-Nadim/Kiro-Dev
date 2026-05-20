@@ -2,68 +2,113 @@
 # Cell: SFT training with LoRA.
 # Why: A clean baseline that other methods (DPO, MA-DPO) must beat.
 #
-# FIX for bitsandbytes/triton crash on Colab:
-#   PEFT calls importlib.util.find_spec("bitsandbytes") via an @lru_cache'd
-#   function. If bnb is broken (triton.ops missing), this crashes. We:
-#   1. Remove bitsandbytes from sys.modules entirely so find_spec returns None
-#   2. Patch the @lru_cache'd checker to always return False
-#   3. Clear the lru_cache so our patch takes effect
+# FIX for Colab environment issues:
+#   1. bitsandbytes has broken triton.ops dependency
+#   2. torchao 0.10.0 (Colab default) is too old for PEFT >= 0.14
+#   We neutralize BOTH by patching every location where they're referenced.
 # =============================================================================
 import importlib
 import importlib.util
 import sys
-from functools import lru_cache
 
-# --- Step 1: Completely remove bitsandbytes from sys.modules -----------------
-_bnb_keys = [k for k in sys.modules if k == "bitsandbytes" or k.startswith("bitsandbytes.")]
-for k in _bnb_keys:
+# =============================================================================
+# NUCLEAR FIX: Remove torchao entirely so PEFT can never find/check it.
+# This is safe because we use standard fp16 LoRA, not quantized layers.
+# =============================================================================
+_torchao_keys = [k for k in list(sys.modules.keys()) if k == "torchao" or k.startswith("torchao.")]
+for k in _torchao_keys:
     del sys.modules[k]
 
-# --- Step 2: Block future imports of bitsandbytes ----------------------------
-# Install an import hook that prevents bitsandbytes from ever loading.
-import importlib.abc
-import importlib.machinery
+# Block future torchao imports.
+class _BlockModuleFinder:
+    """Prevents specified modules from being imported."""
+    def __init__(self, blocked_prefixes):
+        self.blocked = blocked_prefixes
 
-
-class _BlockBnbFinder(importlib.abc.MetaPathFinder):
-    """Prevents bitsandbytes from being imported."""
     def find_module(self, fullname, path=None):
-        if fullname == "bitsandbytes" or fullname.startswith("bitsandbytes."):
-            return self
+        for prefix in self.blocked:
+            if fullname == prefix or fullname.startswith(prefix + "."):
+                return self
         return None
 
     def load_module(self, fullname):
-        raise ImportError(f"{fullname} is blocked (bnb neutralizer active)")
+        raise ImportError(f"{fullname} is blocked by notebook neutralizer")
 
+# Block both bitsandbytes and torchao.
+_blocker = _BlockModuleFinder(["bitsandbytes", "torchao"])
+if _blocker not in sys.meta_path:
+    sys.meta_path.insert(0, _blocker)
 
-# Insert at the FRONT of sys.meta_path so it takes priority.
-sys.meta_path.insert(0, _BlockBnbFinder())
+# Also remove bitsandbytes.
+_bnb_keys = [k for k in list(sys.modules.keys()) if k == "bitsandbytes" or k.startswith("bitsandbytes.")]
+for k in _bnb_keys:
+    del sys.modules[k]
 
-# --- Step 3: Patch PEFT's cached availability checks -------------------------
+# =============================================================================
+# Now patch PEFT's import_utils at EVERY level.
+# The @lru_cache means we must clear it AND replace the function object AND
+# patch any module that already imported a reference to the old function.
+# =============================================================================
 import peft.import_utils
 
-# Clear the lru_cache on the existing functions (if they have it).
-for fn_name in ["is_bnb_available", "is_bnb_4bit_available"]:
+# Patch all availability checkers.
+_fns_to_kill = [
+    "is_bnb_available",
+    "is_bnb_4bit_available",
+    "is_torchao_available",
+]
+
+for fn_name in _fns_to_kill:
     fn = getattr(peft.import_utils, fn_name, None)
-    if fn is not None and hasattr(fn, "cache_clear"):
+    if fn is None:
+        continue
+    # Clear lru_cache if present.
+    if hasattr(fn, "cache_clear"):
         fn.cache_clear()
+    # Replace on the module.
+    setattr(peft.import_utils, fn_name, lambda: False)
 
-# Replace with simple lambdas that always return False.
-peft.import_utils.is_bnb_available = lambda: False
-peft.import_utils.is_bnb_4bit_available = lambda: False
+# CRITICAL: Also patch in peft.tuners.lora.model where it's imported directly.
+try:
+    import peft.tuners.lora.model as _lora_model
+    if hasattr(_lora_model, "is_torchao_available"):
+        _lora_model.is_torchao_available = lambda: False
+    if hasattr(_lora_model, "is_bnb_available"):
+        _lora_model.is_bnb_available = lambda: False
+except (ImportError, AttributeError):
+    pass
 
-# --- Step 4: Neutralize torchao version check --------------------------------
-# PEFT >= 0.14 checks torchao version and raises ImportError if too old.
-# We don't use torchao quantization, so we disable the check entirely.
-for fn_name in ["is_torchao_available"]:
-    fn = getattr(peft.import_utils, fn_name, None)
-    if fn is not None and hasattr(fn, "cache_clear"):
-        fn.cache_clear()
-    if fn is not None:
-        setattr(peft.import_utils, fn_name, lambda: False)
+# Also patch in peft.tuners.tuners_utils if it imported these.
+try:
+    import peft.tuners.tuners_utils as _tuners_utils
+    if hasattr(_tuners_utils, "is_torchao_available"):
+        _tuners_utils.is_torchao_available = lambda: False
+    if hasattr(_tuners_utils, "is_bnb_available"):
+        _tuners_utils.is_bnb_available = lambda: False
+except (ImportError, AttributeError):
+    pass
 
-print("bitsandbytes + torchao neutralized — PEFT will use standard fp16 LoRA only.")
+# Also patch peft.mapping / peft.mapping_func.
+try:
+    import peft.mapping_func as _mapping
+    if hasattr(_mapping, "is_torchao_available"):
+        _mapping.is_torchao_available = lambda: False
+except (ImportError, AttributeError):
+    pass
 
+# Patch ANY peft submodule that has a reference to these functions.
+for mod_name, mod in list(sys.modules.items()):
+    if mod is None or not mod_name.startswith("peft"):
+        continue
+    for fn_name in _fns_to_kill:
+        if hasattr(mod, fn_name):
+            setattr(mod, fn_name, lambda: False)
+
+print("bitsandbytes + torchao fully neutralized across all PEFT submodules.")
+
+# =============================================================================
+# Actual SFT training code below.
+# =============================================================================
 from transformers import Trainer, DataCollatorForLanguageModeling
 
 # Build SFT dataset: (prompt + gold_response) for each train example.
@@ -100,7 +145,7 @@ class SimpleSFTDataset(TorchDataset):
     def __getitem__(self, i): return self.items[i]
 
 
-# LoRA wrap — now safe because we disabled the bnb dispatch above.
+# LoRA wrap — safe because we disabled bnb + torchao dispatches above.
 peft_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
     r=CFG.lora_r,
