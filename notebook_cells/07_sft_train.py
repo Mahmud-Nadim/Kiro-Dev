@@ -2,31 +2,57 @@
 # Cell: SFT training with LoRA.
 # Why: A clean baseline that other methods (DPO, MA-DPO) must beat.
 #
-# FIX for bitsandbytes/triton crash:
-#   We block bitsandbytes from being imported by PEFT. We do NOT use 8-bit
-#   quantization, so this is safe. If bnb is already broken in your env,
-#   this prevents the crash entirely.
+# FIX for bitsandbytes/triton crash on Colab:
+#   PEFT calls importlib.util.find_spec("bitsandbytes") via an @lru_cache'd
+#   function. If bnb is broken (triton.ops missing), this crashes. We:
+#   1. Remove bitsandbytes from sys.modules entirely so find_spec returns None
+#   2. Patch the @lru_cache'd checker to always return False
+#   3. Clear the lru_cache so our patch takes effect
 # =============================================================================
 import importlib
+import importlib.util
 import sys
+from functools import lru_cache
 
-# --- Neutralize bitsandbytes so PEFT doesn't try to import it ----------------
-# This avoids "ModuleNotFoundError: No module named 'triton.ops'" on Colab.
-if "bitsandbytes" not in sys.modules:
-    # Create a dummy module so `import bitsandbytes` doesn't crash
-    import types
-    _fake_bnb = types.ModuleType("bitsandbytes")
-    _fake_bnb.__version__ = "0.0.0"
-    sys.modules["bitsandbytes"] = _fake_bnb
-    # Also block sub-imports that PEFT touches
-    for sub in ["bitsandbytes.nn", "bitsandbytes.nn.modules",
-                "bitsandbytes.functional", "bitsandbytes.autograd"]:
-        sys.modules[sub] = types.ModuleType(sub)
+# --- Step 1: Completely remove bitsandbytes from sys.modules -----------------
+_bnb_keys = [k for k in sys.modules if k == "bitsandbytes" or k.startswith("bitsandbytes.")]
+for k in _bnb_keys:
+    del sys.modules[k]
 
-# Now force peft to think bnb is NOT available so it skips the bnb dispatch.
+# --- Step 2: Block future imports of bitsandbytes ----------------------------
+# Install an import hook that prevents bitsandbytes from ever loading.
+import importlib.abc
+import importlib.machinery
+
+
+class _BlockBnbFinder(importlib.abc.MetaPathFinder):
+    """Prevents bitsandbytes from being imported."""
+    def find_module(self, fullname, path=None):
+        if fullname == "bitsandbytes" or fullname.startswith("bitsandbytes."):
+            return self
+        return None
+
+    def load_module(self, fullname):
+        raise ImportError(f"{fullname} is blocked (bnb neutralizer active)")
+
+
+# Insert at the FRONT of sys.meta_path so it takes priority.
+sys.meta_path.insert(0, _BlockBnbFinder())
+
+# --- Step 3: Patch PEFT's cached availability checks -------------------------
 import peft.import_utils
+
+# Clear the lru_cache on the existing functions (if they have it).
+for fn_name in ["is_bnb_available", "is_bnb_4bit_available"]:
+    fn = getattr(peft.import_utils, fn_name, None)
+    if fn is not None and hasattr(fn, "cache_clear"):
+        fn.cache_clear()
+
+# Replace with simple lambdas that always return False.
 peft.import_utils.is_bnb_available = lambda: False
 peft.import_utils.is_bnb_4bit_available = lambda: False
+
+print("bitsandbytes fully neutralized — PEFT will use standard fp16 LoRA only.")
 
 from transformers import Trainer, DataCollatorForLanguageModeling
 
