@@ -8,8 +8,10 @@
 # six times (one per axis) and ensemble — see the comment at the bottom.
 # =============================================================================
 
-# Free memory.
-del dpo_model, dpo_trainer, base_for_dpo
+# Free memory — safe deletion handles skipped/re-run cells.
+for _varname in ["dpo_model", "dpo_trainer", "base_for_dpo"]:
+    if _varname in dir():
+        exec(f"del {_varname}")
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 

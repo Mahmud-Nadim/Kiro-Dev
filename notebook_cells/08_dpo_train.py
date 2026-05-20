@@ -34,7 +34,10 @@ print(f"DPO training pairs: {len(dpo_pairs)}")
 dpo_dataset = Dataset.from_list(dpo_pairs)
 
 # Reload a fresh LoRA model for DPO (separate from SFT model).
-del sft_model
+# Safe deletion — handles case where SFT cell was re-run or skipped.
+for _varname in ["sft_model", "trainer"]:
+    if _varname in dir():
+        exec(f"del {_varname}")
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
